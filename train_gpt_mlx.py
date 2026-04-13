@@ -94,6 +94,12 @@ class Hyperparameters:
     muon_momentum_warmup_steps: int = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     grad_clip_norm: float = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
+    # Depth recurrence: comma-separated layer indices to repeat (e.g. "3,4").
+    # These physical layers are run a second time in both encoder and decoder halves.
+    recur_layers: str = os.environ.get("RECUR_LAYERS", "")
+    # Step at which to activate recurrence (0 = always on, >0 = delayed activation).
+    recur_start_step: int = int(os.environ.get("RECUR_START_STEP", 0))
+
     out_dir: str = os.environ.get("OUT_DIR", "logs")
 
     @property
@@ -386,7 +392,7 @@ class GPT(nn.Module):
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+                 qk_gain_init: float, recur_layers: list[int] | None = None):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -402,6 +408,10 @@ class GPT(nn.Module):
             Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
             for i in range(num_layers)
         ]
+        # Depth recurrence: which physical layers to repeat.
+        # Stored as plain Python attributes (not mx.array) — filtered out before serialization.
+        self._recur_layers = recur_layers or []
+        self._recur_active = False
         self.final_norm = RMSNormNoWeight()
 
         for b in self.blocks:
@@ -415,21 +425,41 @@ class GPT(nn.Module):
         c = self.logit_softcap
         return c * mx.tanh(logits / c)
 
+    def _encoder_order(self) -> list[int]:
+        """Physical block indices for the encoder half, with optional recurrence."""
+        order = list(range(self.num_encoder_layers))
+        if self._recur_active and self._recur_layers:
+            # Append the recurred layers at the end of the encoder pass.
+            recur_enc = [l for l in self._recur_layers if l < self.num_encoder_layers]
+            order.extend(recur_enc)
+        return order
+
+    def _decoder_order(self) -> list[int]:
+        """Physical block indices for the decoder half, with optional recurrence."""
+        order = list(range(self.num_encoder_layers, self.num_encoder_layers + self.num_decoder_layers))
+        if self._recur_active and self._recur_layers:
+            # Prepend recurred layers that fall in the decoder range.
+            recur_dec = [l for l in self._recur_layers if l >= self.num_encoder_layers]
+            order = recur_dec + order
+        return order
+
     def __call__(self, input_ids: mx.array) -> mx.array:
         x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
         x0 = x
         skips: list[mx.array] = []
 
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+        enc_order = self._encoder_order()
+        for phys_idx in enc_order:
+            x = self.blocks[phys_idx](x, x0)
             skips.append(x)
-        for i in range(self.num_decoder_layers):
-            # Odd layer counts have one more decoder block than encoder block. The baseline only
-            # applies a skip connection when one exists, then runs the remaining decoder block(s)
-            # without an added skip.
+
+        dec_order = self._decoder_order()
+        # Only use skip connections for the original (non-recurred) portion.
+        # We have num_skip_weights skips available; pop them for the first layers.
+        for i, phys_idx in enumerate(dec_order):
             if skips:
-                x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+                x = x + self.skip_weights[min(i, self.num_skip_weights - 1)].astype(x.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[phys_idx](x, x0)
         return self.final_norm(x)
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
@@ -885,6 +915,7 @@ def main() -> None:
     # ==============================================================================
     # MODEL + OPTIMIZER SETUP
     # ==============================================================================
+    recur_layers = [int(x) for x in args.recur_layers.split(",") if x.strip()] if args.recur_layers else []
     model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -897,6 +928,7 @@ def main() -> None:
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
+        recur_layers=recur_layers,
     )
     opt = SplitOptimizers(model, args)
 
@@ -935,6 +967,7 @@ def main() -> None:
         f"model_params:{n_params} vocab_size:{args.vocab_size} layers:{args.num_layers} "
         f"dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
         f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
+        + (f" recur_layers:{recur_layers} recur_start_step:{args.recur_start_step}" if recur_layers else "")
     )
     log(
         f"iterations:{args.iterations} train_batch_tokens:{args.train_batch_tokens} grad_accum_steps:{args.grad_accum_steps} "
@@ -1025,6 +1058,12 @@ def main() -> None:
                 log(f"stopping_early: wallclock_cap train_time:{train_time_ms:.0f}ms step:{step}/{args.iterations}")
             break
 
+        # Activate depth recurrence at the configured step.
+        if recur_layers and not model._recur_active:
+            if args.recur_start_step <= 0 or step >= args.recur_start_step:
+                model._recur_active = True
+                log(f"depth_recurrence:activated step:{step} layers:{recur_layers}")
+
         lr_mul = args.lr_mul(step, train_time_ms + 1000.0 * (time.perf_counter() - t0))
         step_t0 = time.perf_counter()
 
@@ -1063,7 +1102,7 @@ def main() -> None:
     # quantized roundtrip directly by loading the dequantized tensors back into the
     # model and running one final validation pass.
     out_path = out_dir / f"{args.run_id}_mlx_model.npz"
-    flat_state = {k: v for k, v in tree_flatten(model.state)}
+    flat_state = {k: v for k, v in tree_flatten(model.state) if isinstance(v, mx.array)}
     mx.savez(str(out_path), **flat_state)
     log(f"saved_model:{out_path} bytes:{out_path.stat().st_size}")
 

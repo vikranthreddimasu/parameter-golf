@@ -86,6 +86,11 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
+    # Depth recurrence: comma-separated layer indices to repeat (e.g. "3,4").
+    recur_layers = os.environ.get("RECUR_LAYERS", "")
+    # Step at which to activate recurrence (0 = always on, >0 = delayed activation).
+    recur_start_step = int(os.environ.get("RECUR_START_STEP", 0))
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -659,6 +664,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        recur_layers: list[int] | None = None,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -671,6 +677,9 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        # Depth recurrence config (not nn.Parameter, just Python state).
+        self._recur_layers = recur_layers or []
+        self._recur_active = False
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -697,6 +706,22 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
+    def _encoder_order(self) -> list[int]:
+        """Physical block indices for the encoder half, with optional recurrence."""
+        order = list(range(self.num_encoder_layers))
+        if self._recur_active and self._recur_layers:
+            recur_enc = [l for l in self._recur_layers if l < self.num_encoder_layers]
+            order.extend(recur_enc)
+        return order
+
+    def _decoder_order(self) -> list[int]:
+        """Physical block indices for the decoder half, with optional recurrence."""
+        order = list(range(self.num_encoder_layers, self.num_encoder_layers + self.num_decoder_layers))
+        if self._recur_active and self._recur_layers:
+            recur_dec = [l for l in self._recur_layers if l >= self.num_encoder_layers]
+            order = recur_dec + order
+        return order
+
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
@@ -704,13 +729,15 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
 
         # First half stores skips; second half reuses them in reverse order.
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+        enc_order = self._encoder_order()
+        for phys_idx in enc_order:
+            x = self.blocks[phys_idx](x, x0)
             skips.append(x)
-        for i in range(self.num_decoder_layers):
+        dec_order = self._decoder_order()
+        for i, phys_idx in enumerate(dec_order):
             if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+                x = x + self.skip_weights[min(i, self.num_skip_weights - 1)].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[phys_idx](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -823,6 +850,7 @@ def main() -> None:
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
 
+    recur_layers = [int(x) for x in args.recur_layers.split(",") if x.strip()] if args.recur_layers else []
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -835,6 +863,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        recur_layers=recur_layers,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -893,7 +922,7 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
-    log0(f"model_params:{n_params}")
+    log0(f"model_params:{n_params}" + (f" recur_layers:{recur_layers} recur_start_step:{args.recur_start_step}" if recur_layers else ""))
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -1003,6 +1032,12 @@ def main() -> None:
                     f"step:{step}/{args.iterations}"
                 )
             break
+
+        # Activate depth recurrence at the configured step.
+        if recur_layers and not base_model._recur_active:
+            if args.recur_start_step <= 0 or step >= args.recur_start_step:
+                base_model._recur_active = True
+                log0(f"depth_recurrence:activated step:{step} layers:{recur_layers}")
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
