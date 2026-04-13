@@ -95,10 +95,19 @@ class Hyperparameters:
     grad_clip_norm: float = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
     # Depth recurrence: comma-separated layer indices to repeat (e.g. "3,4").
-    # These physical layers are run a second time in both encoder and decoder halves.
     recur_layers: str = os.environ.get("RECUR_LAYERS", "")
-    # Step at which to activate recurrence (0 = always on, >0 = delayed activation).
     recur_start_step: int = int(os.environ.get("RECUR_START_STEP", 0))
+
+    # Research-backed features (all off by default for backward compatibility).
+    sigmoid_gate: bool = bool(int(os.environ.get("SIGMOID_GATE", "0")))        # Sigmoid gated attention output
+    label_smoothing: float = float(os.environ.get("LABEL_SMOOTHING", 0.0))     # Label smoothing epsilon
+    meta_tokens: int = int(os.environ.get("META_TOKENS", 0))                   # Learnable meta tokens prepended
+    swiglu: bool = bool(int(os.environ.get("SWIGLU", "0")))                    # SwiGLU activation instead of relu²
+    leaky_relu_sq: bool = bool(int(os.environ.get("LEAKY_RELU_SQ", "0")))      # LeakyReLU(0.5)² (SOTA activation)
+    leaky_relu_alpha: float = float(os.environ.get("LEAKY_RELU_ALPHA", 0.5))   # Alpha for leaky relu
+
+    # Skip final model save + quantized roundtrip eval (for fast proxy experiments).
+    skip_final_eval: bool = bool(int(os.environ.get("SKIP_FINAL_EVAL", "0")))
 
     out_dir: str = os.environ.get("OUT_DIR", "logs")
 
@@ -345,16 +354,30 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    # Baseline MLP uses relu^2 instead of GELU/SiLU. It is cheap and works well in this setup.
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: int, activation: str = "relu_sq"):
         super().__init__()
         hidden = dim * mlp_mult
-        self.fc = CastedLinear(dim, hidden)
-        self.proj = CastedLinear(hidden, dim)
+        self.activation = activation
+        if activation == "swiglu":
+            # SwiGLU: gate and value projections, 2/3 hidden to match param count
+            swiglu_hidden = (hidden * 2 // 3 + 7) & ~7  # round to multiple of 8
+            self.fc_gate = CastedLinear(dim, swiglu_hidden)
+            self.fc_val = CastedLinear(dim, swiglu_hidden)
+            self.proj = CastedLinear(swiglu_hidden, dim)
+        else:
+            self.fc = CastedLinear(dim, hidden)
+            self.proj = CastedLinear(hidden, dim)
+        self._leaky_alpha = 0.5  # set externally if needed
 
     def __call__(self, x: mx.array) -> mx.array:
-        x = nn.relu(self.fc(x))
-        return self.proj(x * x)
+        if self.activation == "swiglu":
+            return self.proj(nn.silu(self.fc_gate(x)) * self.fc_val(x))
+        elif self.activation == "leaky_relu_sq":
+            h = mx.where(self.fc(x) > 0, self.fc(x), self._leaky_alpha * self.fc(x))
+            return self.proj(h * h)
+        else:  # relu_sq (baseline)
+            x = nn.relu(self.fc(x))
+            return self.proj(x * x)
 
 
 class Block(nn.Module):
@@ -366,20 +389,29 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        activation: str = "relu_sq",
+        sigmoid_gate: bool = False,
     ):
         super().__init__()
         self.attn_norm = RMSNormNoWeight()
         self.mlp_norm = RMSNormNoWeight()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = MLP(dim, mlp_mult, activation=activation)
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
         self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
+        # Sigmoid gated attention: Y' = Y * sigmoid(X @ W_gate)
+        self._sigmoid_gate = sigmoid_gate
+        if sigmoid_gate:
+            self.attn_gate = CastedLinear(dim, dim)
 
     def __call__(self, x: mx.array, x0: mx.array) -> mx.array:
         mix = self.resid_mix.astype(x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
+        normed = self.attn_norm(x)
+        attn_out = self.attn(normed)
+        if self._sigmoid_gate:
+            attn_out = attn_out * mx.sigmoid(self.attn_gate(normed))
         x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
@@ -392,24 +424,31 @@ class GPT(nn.Module):
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float, recur_layers: list[int] | None = None):
+                 qk_gain_init: float, recur_layers: list[int] | None = None,
+                 activation: str = "relu_sq", sigmoid_gate: bool = False,
+                 num_meta_tokens: int = 0, label_smoothing: float = 0.0):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
+        self._label_smoothing = label_smoothing
+        self._num_meta_tokens = num_meta_tokens
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
+        # Learnable meta tokens (Hymba-style) prepended to every sequence.
+        if num_meta_tokens > 0:
+            self.meta_tokens = mx.zeros((1, num_meta_tokens, dim), dtype=mx.float32)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
         self.blocks = [
-            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
+                  activation=activation, sigmoid_gate=sigmoid_gate)
             for i in range(num_layers)
         ]
-        # Depth recurrence: which physical layers to repeat.
-        # Stored as plain Python attributes (not mx.array) — filtered out before serialization.
+        # Depth recurrence config (plain Python, not serialized).
         self._recur_layers = recur_layers or []
         self._recur_active = False
         self.final_norm = RMSNormNoWeight()
@@ -445,6 +484,11 @@ class GPT(nn.Module):
 
     def __call__(self, input_ids: mx.array) -> mx.array:
         x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
+        # Prepend learnable meta tokens if configured.
+        if self._num_meta_tokens > 0:
+            bsz = x.shape[0]
+            meta = mx.broadcast_to(self.meta_tokens.astype(x.dtype), (bsz, self._num_meta_tokens, x.shape[-1]))
+            x = mx.concatenate([meta, x], axis=1)
         x0 = x
         skips: list[mx.array] = []
 
@@ -454,23 +498,34 @@ class GPT(nn.Module):
             skips.append(x)
 
         dec_order = self._decoder_order()
-        # Only use skip connections for the original (non-recurred) portion.
-        # We have num_skip_weights skips available; pop them for the first layers.
         for i, phys_idx in enumerate(dec_order):
             if skips:
                 x = x + self.skip_weights[min(i, self.num_skip_weights - 1)].astype(x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[phys_idx](x, x0)
-        return self.final_norm(x)
+        x = self.final_norm(x)
+        # Strip meta tokens before returning.
+        if self._num_meta_tokens > 0:
+            x = x[:, self._num_meta_tokens:, :]
+        return x
+
+    def _ce_loss(self, logits: mx.array, targets: mx.array) -> mx.array:
+        """Cross-entropy with optional label smoothing."""
+        if self._label_smoothing > 0:
+            eps = self._label_smoothing
+            n_classes = logits.shape[-1]
+            log_probs = mx.log(mx.softmax(logits.astype(mx.float32), axis=-1) + 1e-9)
+            nll = -mx.take_along_axis(log_probs, targets[:, None], axis=-1).squeeze(-1)
+            smooth = -log_probs.mean(axis=-1)
+            return ((1.0 - eps) * nll + eps * smooth).mean()
+        return nn.losses.cross_entropy(logits.astype(mx.float32), targets, reduction="mean")
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
-        # Cross-entropy over flattened tokens. We keep optional logit chunking because it is a useful
-        # memory knob on Macs, but the common path is chunk_tokens=0 (single matmul + CE).
         x = self(input_ids).reshape(-1, self.tok_emb.weight.shape[1])
         y = target_ids.reshape(-1)
         if self.logit_chunk_tokens <= 0 or x.shape[0] <= self.logit_chunk_tokens:
             logits_proj = x @ self.tok_emb.weight.astype(x.dtype).T
             logits = self.softcap(logits_proj)
-            return nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="mean")
+            return self._ce_loss(logits, y)
 
         loss_sum = mx.array(0.0, dtype=mx.float32)
         n = int(x.shape[0])
@@ -478,7 +533,7 @@ class GPT(nn.Module):
             e = min(s + self.logit_chunk_tokens, n)
             logits_proj = x[s:e] @ self.tok_emb.weight.astype(x.dtype).T
             logits = self.softcap(logits_proj)
-            loss_sum = loss_sum + nn.losses.cross_entropy(logits.astype(mx.float32), y[s:e], reduction="sum")
+            loss_sum = loss_sum + self._ce_loss(logits, y[s:e]) * float(e - s)
         return loss_sum / float(n)
 
 # ==============================================================================
@@ -916,6 +971,12 @@ def main() -> None:
     # MODEL + OPTIMIZER SETUP
     # ==============================================================================
     recur_layers = [int(x) for x in args.recur_layers.split(",") if x.strip()] if args.recur_layers else []
+    # Determine activation type.
+    activation = "relu_sq"
+    if args.swiglu:
+        activation = "swiglu"
+    elif args.leaky_relu_sq:
+        activation = "leaky_relu_sq"
     model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -929,6 +990,10 @@ def main() -> None:
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
         recur_layers=recur_layers,
+        activation=activation,
+        sigmoid_gate=args.sigmoid_gate,
+        num_meta_tokens=args.meta_tokens,
+        label_smoothing=args.label_smoothing,
     )
     opt = SplitOptimizers(model, args)
 
@@ -1098,45 +1163,48 @@ def main() -> None:
     # ==============================================================================
     # FINAL SERIALIZATION + QUANTIZED ROUNDTRIP EVAL
     # ==============================================================================
-    # We always write a raw artifact and a quantized artifact, then validate the
-    # quantized roundtrip directly by loading the dequantized tensors back into the
-    # model and running one final validation pass.
-    out_path = out_dir / f"{args.run_id}_mlx_model.npz"
-    flat_state = {k: v for k, v in tree_flatten(model.state) if isinstance(v, mx.array)}
-    mx.savez(str(out_path), **flat_state)
-    log(f"saved_model:{out_path} bytes:{out_path.stat().st_size}")
+    if args.skip_final_eval:
+        log("skip_final_eval:true — skipping serialization and quantized roundtrip")
+    else:
+        # We always write a raw artifact and a quantized artifact, then validate the
+        # quantized roundtrip directly by loading the dequantized tensors back into the
+        # model and running one final validation pass.
+        out_path = out_dir / f"{args.run_id}_mlx_model.npz"
+        flat_state = {k: v for k, v in tree_flatten(model.state) if isinstance(v, mx.array)}
+        mx.savez(str(out_path), **flat_state)
+        log(f"saved_model:{out_path} bytes:{out_path.stat().st_size}")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(flat_state)
-    quant_raw = pickle.dumps(quant_obj, protocol=pickle.HIGHEST_PROTOCOL)
-    quant_blob = zlib.compress(quant_raw, level=9)
-    quant_serialized_bytes = len(quant_raw)
-    quant_path = out_dir / f"{args.run_id}_mlx_model.int8.ptz"
-    with quant_path.open("wb") as f:
-        f.write(quant_blob)
-    quant_file_bytes = quant_path.stat().st_size
-    ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
-    log(
-        f"serialized_model_int8_zlib:{quant_file_bytes} bytes "
-        f"(payload:{quant_stats['int8_payload_bytes']} raw_pickle:{quant_serialized_bytes} payload_ratio:{ratio:.2f}x)"
-    )
+        quant_obj, quant_stats = quantize_state_dict_int8(flat_state)
+        quant_raw = pickle.dumps(quant_obj, protocol=pickle.HIGHEST_PROTOCOL)
+        quant_blob = zlib.compress(quant_raw, level=9)
+        quant_serialized_bytes = len(quant_raw)
+        quant_path = out_dir / f"{args.run_id}_mlx_model.int8.ptz"
+        with quant_path.open("wb") as f:
+            f.write(quant_blob)
+        quant_file_bytes = quant_path.stat().st_size
+        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
+        log(
+            f"serialized_model_int8_zlib:{quant_file_bytes} bytes "
+            f"(payload:{quant_stats['int8_payload_bytes']} raw_pickle:{quant_serialized_bytes} payload_ratio:{ratio:.2f}x)"
+        )
 
-    with quant_path.open("rb") as f:
-        quant_blob_disk = f.read()
-    quant_flat = dequantize_state_dict_int8(pickle.loads(zlib.decompress(quant_blob_disk)))
-    model.update(tree_unflatten(list(quant_flat.items())))
-    q_t0 = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
-        args,
-        compiled_loss,
-        val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
-        log_fn=log,
-    )
-    q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
-    log(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
-    log(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+        with quant_path.open("rb") as f:
+            quant_blob_disk = f.read()
+        quant_flat = dequantize_state_dict_int8(pickle.loads(zlib.decompress(quant_blob_disk)))
+        model.update(tree_unflatten(list(quant_flat.items())))
+        q_t0 = time.perf_counter()
+        q_val_loss, q_val_bpb = eval_val(
+            args,
+            compiled_loss,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            log_fn=log,
+        )
+        q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
+        log(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
+        log(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
 
 if __name__ == "__main__":

@@ -91,6 +91,17 @@ class Hyperparameters:
     # Step at which to activate recurrence (0 = always on, >0 = delayed activation).
     recur_start_step = int(os.environ.get("RECUR_START_STEP", 0))
 
+    # Research-backed features (all off by default for backward compatibility).
+    sigmoid_gate: bool = bool(int(os.environ.get("SIGMOID_GATE", "0")))
+    label_smoothing: float = float(os.environ.get("LABEL_SMOOTHING", 0.0))
+    meta_tokens: int = int(os.environ.get("META_TOKENS", 0))
+    swiglu: bool = bool(int(os.environ.get("SWIGLU", "0")))
+    leaky_relu_sq: bool = bool(int(os.environ.get("LEAKY_RELU_SQ", "0")))
+    leaky_relu_alpha: float = float(os.environ.get("LEAKY_RELU_ALPHA", 0.5))
+
+    # Skip final model save + quantized roundtrip eval (for fast proxy experiments).
+    skip_final_eval: bool = bool(int(os.environ.get("SKIP_FINAL_EVAL", "0")))
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -609,17 +620,30 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: int, activation: str = "relu_sq"):
         super().__init__()
         hidden = mlp_mult * dim
-        self.fc = CastedLinear(dim, hidden, bias=False)
-        self.proj = CastedLinear(hidden, dim, bias=False)
+        self.activation = activation
+        if activation == "swiglu":
+            swiglu_hidden = (hidden * 2 // 3 + 7) & ~7
+            self.fc_gate = CastedLinear(dim, swiglu_hidden, bias=False)
+            self.fc_val = CastedLinear(dim, swiglu_hidden, bias=False)
+            self.proj = CastedLinear(swiglu_hidden, dim, bias=False)
+        else:
+            self.fc = CastedLinear(dim, hidden, bias=False)
+            self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
+        self._leaky_alpha = 0.5
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
-        return self.proj(x.square())
+        if self.activation == "swiglu":
+            return self.proj(F.silu(self.fc_gate(x)) * self.fc_val(x))
+        elif self.activation == "leaky_relu_sq":
+            h = F.leaky_relu(self.fc(x), negative_slope=self._leaky_alpha)
+            return self.proj(h.square())
+        else:
+            x = torch.relu(self.fc(x))
+            return self.proj(x.square())
 
 
 class Block(nn.Module):
@@ -631,20 +655,28 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        activation: str = "relu_sq",
+        sigmoid_gate: bool = False,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = MLP(dim, mlp_mult, activation=activation)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self._sigmoid_gate = sigmoid_gate
+        if sigmoid_gate:
+            self.attn_gate = CastedLinear(dim, dim, bias=False)
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
+        normed = self.attn_norm(x)
+        attn_out = self.attn(normed)
+        if self._sigmoid_gate:
+            attn_out = attn_out * torch.sigmoid(self.attn_gate(normed))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
@@ -665,6 +697,10 @@ class GPT(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         recur_layers: list[int] | None = None,
+        activation: str = "relu_sq",
+        sigmoid_gate: bool = False,
+        num_meta_tokens: int = 0,
+        label_smoothing: float = 0.0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -672,7 +708,11 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self._label_smoothing = label_smoothing
+        self._num_meta_tokens = num_meta_tokens
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        if num_meta_tokens > 0:
+            self.meta_tokens = nn.Parameter(torch.zeros(1, num_meta_tokens, model_dim))
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -689,6 +729,8 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    activation=activation,
+                    sigmoid_gate=sigmoid_gate,
                 )
                 for i in range(num_layers)
             ]
@@ -725,6 +767,11 @@ class GPT(nn.Module):
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
+        # Prepend learnable meta tokens if configured.
+        if self._num_meta_tokens > 0:
+            bsz = x.shape[0]
+            meta = self.meta_tokens.to(dtype=x.dtype).expand(bsz, -1, -1)
+            x = torch.cat([meta, x], dim=1)
         x0 = x
         skips: list[Tensor] = []
 
@@ -739,7 +786,11 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[min(i, self.num_skip_weights - 1)].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[phys_idx](x, x0)
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
+        x = self.final_norm(x)
+        # Strip meta tokens before computing loss.
+        if self._num_meta_tokens > 0:
+            x = x[:, self._num_meta_tokens:, :]
+        x = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -748,6 +799,8 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        if self._label_smoothing > 0:
+            return F.cross_entropy(logits.float(), targets, reduction="mean", label_smoothing=self._label_smoothing)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
@@ -851,6 +904,7 @@ def main() -> None:
     # -----------------------------
 
     recur_layers = [int(x) for x in args.recur_layers.split(",") if x.strip()] if args.recur_layers else []
+    activation = "swiglu" if args.swiglu else ("leaky_relu_sq" if args.leaky_relu_sq else "relu_sq")
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -864,10 +918,17 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
         recur_layers=recur_layers,
+        activation=activation,
+        sigmoid_gate=args.sigmoid_gate,
+        num_meta_tokens=args.meta_tokens,
+        label_smoothing=args.label_smoothing,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
+    if args.leaky_relu_sq:
+        for block in base_model.blocks:
+            block.mlp._leaky_alpha = args.leaky_relu_alpha
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
@@ -1100,58 +1161,61 @@ def main() -> None:
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
 
-    if master_process:
-        torch.save(base_model.state_dict(), "final_model.pt")
-        model_bytes = os.path.getsize("final_model.pt")
-        code_bytes = len(code.encode("utf-8"))
-        log0(f"Serialized model: {model_bytes} bytes")
-        log0(f"Code size: {code_bytes} bytes")
-        log0(f"Total submission size: {model_bytes + code_bytes} bytes")
+    if args.skip_final_eval:
+        log0("skip_final_eval:true — skipping serialization and quantized roundtrip")
+    else:
+        if master_process:
+            torch.save(base_model.state_dict(), "final_model.pt")
+            model_bytes = os.path.getsize("final_model.pt")
+            code_bytes = len(code.encode("utf-8"))
+            log0(f"Serialized model: {model_bytes} bytes")
+            log0(f"Code size: {code_bytes} bytes")
+            log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
-    quant_buf = io.BytesIO()
-    torch.save(quant_obj, quant_buf)
-    quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
-    quant_raw_bytes = len(quant_raw)
-    if master_process:
-        with open("final_model.int8.ptz", "wb") as f:
-            f.write(quant_blob)
-        quant_file_bytes = os.path.getsize("final_model.int8.ptz")
-        code_bytes = len(code.encode("utf-8"))
-        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
-        log0(
-            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
-            f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
+        quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+        quant_buf = io.BytesIO()
+        torch.save(quant_obj, quant_buf)
+        quant_raw = quant_buf.getvalue()
+        quant_blob = zlib.compress(quant_raw, level=9)
+        quant_raw_bytes = len(quant_raw)
+        if master_process:
+            with open("final_model.int8.ptz", "wb") as f:
+                f.write(quant_blob)
+            quant_file_bytes = os.path.getsize("final_model.int8.ptz")
+            code_bytes = len(code.encode("utf-8"))
+            ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
+            log0(
+                f"Serialized model int8+zlib: {quant_file_bytes} bytes "
+                f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
+            )
+            log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+
+        if distributed:
+            dist.barrier()
+        with open("final_model.int8.ptz", "rb") as f:
+            quant_blob_disk = f.read()
+        quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+        base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+        torch.cuda.synchronize()
+        t_qeval = time.perf_counter()
+        q_val_loss, q_val_bpb = eval_val(
+            args,
+            model,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
         )
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
-
-    if distributed:
-        dist.barrier()
-    with open("final_model.int8.ptz", "rb") as f:
-        quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
-    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
-    torch.cuda.synchronize()
-    t_qeval = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
-        args,
-        model,
-        rank,
-        world_size,
-        device,
-        grad_accum_steps,
-        val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
-    )
-    torch.cuda.synchronize()
-    log0(
-        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
-        f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
-    )
-    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+        torch.cuda.synchronize()
+        log0(
+            f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
+        )
+        log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
